@@ -17,6 +17,7 @@ This XBlock is not compatible with its `ancestor <https://github.com/raccoongang
 Features
 --------
 
+* Full SCORM data student reports for staff users
 * Optional auto-fullscreen
 * Integrated grading, compatible with rescoring
 * Compatibility with `Django storages <https://django-storages.readthedocs.io/>`__, customizable storage backend
@@ -65,7 +66,7 @@ By default, static assets are stored in the default Django storage backend. To o
         from django.conf import settings
         from django.core.files.storage import get_storage_class
         from openedx.core.djangoapps.site_configuration.models import SiteConfiguration
-        
+
         subfolder = SiteConfiguration.get_value_for_org(
             xblock.location.org, "SCORM_STORAGE_NAME", "default"
         )
