@@ -19,6 +19,7 @@ Features
 
 * Full SCORM data student reports for staff users
 * Optional auto-fullscreen
+* Optional display in pop-up window
 * Integrated grading, compatible with rescoring
 * Compatibility with `Django storages <https://django-storages.readthedocs.io/>`__, customizable storage backend
 * Works with Juniper, the latest Open edX release
