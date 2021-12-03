@@ -39,7 +39,7 @@ setup(
         "Community": "https://discuss.overhang.io",
     },
     packages=["openedxscorm"],
-    python_requires=">=3.5",
+    python_requires="<3.0",
     install_requires=["xblock", "web-fragments"],
     entry_points={"xblock.v1": ["scorm = openedxscorm:ScormXBlock"]},
     package_data=package_data("openedxscorm", ["static", "public", "locale"]),
