@@ -85,6 +85,8 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         }
     """
 
+    show_in_read_only_mode = True
+
     display_name = String(
         display_name=_("Display Name"),
         help=_("Display name for this module"),
