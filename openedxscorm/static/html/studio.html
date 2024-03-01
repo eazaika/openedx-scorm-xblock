@@ -1,4 +1,4 @@
-{% load i18n %}
+{% load i18n l10n %}
 
 <div class="wrapper-comp-settings is-active editor-with-buttons" id="settings-tab">
     <ul class="list-input settings-list">
@@ -25,9 +25,8 @@
             <div class="wrapper-comp-setting">
                 <label class="label setting-label" for="has_score">{% trans field_has_score.display_name %}</label>
                 <select name="has_score" id="has_score">
-                    {% for option in field_has_score.values %}
-                    <option value="{{ option.value }}" {% if option.value == scorm_xblock.has_score %}selected{% endif %}>{% trans option.display_name %}</option>
-                    {% endfor %}
+                    <option value="1" {% if scorm_xblock.has_score %}selected{% endif %}>{% trans "True" %}</option>
+                    <option value="0" {% if not scorm_xblock.has_score %}selected{% endif %}>{% trans "False" %}</option>
                 </select>
             </div>
             <span class="tip setting-help">{% trans field_has_score.help %}</span>
@@ -36,7 +35,7 @@
         <li class="field comp-setting-entry is-set">
             <div class="wrapper-comp-setting">
                 <label class="label setting-label" for="weight">{% trans field_weight.display_name %}</label>
-                <input class="input setting-input" name="weight" id="weight" value="{{ scorm_xblock.weight }}" type="number" />
+                <input class="input setting-input" name="weight" id="weight" value="{{ scorm_xblock.weight|unlocalize }}" type="number" />
             </div>
             <span class="tip setting-help">{% trans field_weight.help %}</span>
         </li>

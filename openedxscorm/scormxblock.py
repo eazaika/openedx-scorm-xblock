@@ -5,17 +5,38 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+import requests
+import mimetypes
 
-from django.core.files import File
+from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
+from django.db.models import Q
 from django.template import Context, Template
 from django.utils import timezone
+from django.utils.module_loading import import_string
+from urllib.parse import urlparse
+import urllib.request
 from webob import Response
 import pkg_resources
+from six import string_types
 
 from web_fragments.fragment import Fragment
 from xblock.core import XBlock
+from xblock.completable import CompletableXBlockMixin
+from xblock.exceptions import JsonHandlerError
 from xblock.fields import Scope, String, Float, Boolean, Dict, DateTime, Integer
+
+try:
+    try:
+        from common.djangoapps.student.models import CourseEnrollment
+    except RuntimeError:
+        # Older Open edX releases have a different import path
+        from student.models import CourseEnrollment
+    from lms.djangoapps.courseware.models import StudentModule
+except ImportError:
+    CourseEnrollment = None
+    StudentModule = None
+
 
 # Make '_' a no-op so we can scrape strings
 def _(text):
@@ -26,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 @XBlock.wants("settings")
-class ScormXBlock(XBlock):
+@XBlock.wants("user")
+class ScormXBlock(XBlock, CompletableXBlockMixin):
     """
     When a user uploads a Scorm package, the zip file is stored in:
 
@@ -43,6 +65,26 @@ class ScormXBlock(XBlock):
 
     Note that neither the folder the folder nor the package file are deleted when the
     xblock is removed.
+
+    By default, static assets are stored in the default Django storage backend. To
+    override this behaviour, you should define a custom storage function. This
+    function must take the xblock instance as its first and only argument. For instance,
+    you can store assets in different directories depending on the XBlock organisation with::
+
+        def scorm_storage(xblock):
+            from django.conf import settings
+            from django.core.files.storage import FileSystemStorage
+            from openedx.core.djangoapps.site_configuration.models import SiteConfiguration
+
+            subfolder = SiteConfiguration.get_value_for_org(
+                xblock.location.org, "SCORM_STORAGE_NAME", "default"
+            )
+            storage_location = os.path.join(settings.MEDIA_ROOT, subfolder)
+            return get_storage_class(settings.DEFAULT_FILE_STORAGE)(location=storage_location)
+
+        XBLOCK_SETTINGS["ScormXBlock"] = {
+            "STORAGE_FUNC": scorm_storage,
+        }
     """
 
     show_in_read_only_mode = True
@@ -59,9 +101,15 @@ class ScormXBlock(XBlock):
     package_meta = Dict(scope=Scope.content)
     scorm_version = String(default="SCORM_12", scope=Scope.settings)
 
-    # save completion_status for SCORM_2004
+    # lesson_status is for SCORM 1.2 and can take the following values:
+    # "passed", "completed", "failed", "incomplete", "browsed", "not attempted"
+    # In SCORM_2004, status is broken down in two elements:
+    # - cmi.completion_status: "completed" vs "incomplete"
+    # - cmi.success_status: "passed" vs "failed"
+    # We denormalize these two elements by storing the completion status in self.lesson_status.
     lesson_status = String(scope=Scope.user_state, default="not attempted")
     success_status = String(scope=Scope.user_state, default="unknown")
+
     lesson_score = Float(scope=Scope.user_state, default=0)
     weight = Float(
         default=1,
@@ -94,6 +142,16 @@ class ScormXBlock(XBlock):
         default=450,
         scope=Scope.settings,
     )
+    popup_on_launch = Boolean(
+        display_name=_("Launch in pop-up window"),
+        help=_(
+            "Launch in pop-up window instead of embedding the SCORM content in "
+            "an iframe. Enable this for older packages that need to be run in "
+            "separate window."
+        ),
+        default=False,
+        scope=Scope.settings,
+    )
 
     has_author_view = True
 
@@ -101,6 +159,12 @@ class ScormXBlock(XBlock):
         template_str = self.resource_string(template_path)
         template = Template(template_str)
         return template.render(Context(context))
+
+    def get_current_user_attr(self, attr: str):
+        return self.get_current_user().opt_attrs.get(attr)
+
+    def get_current_user(self):
+        return self.runtime.service(self, "user").get_current_user()
 
     @staticmethod
     def resource_string(path):
@@ -114,24 +178,62 @@ class ScormXBlock(XBlock):
             context[
                 "message"
             ] = "Click 'Edit' to modify this module and upload a new SCORM package."
+        context["can_view_student_reports"] = True
         return self.student_view(context=context)
 
     def student_view(self, context=None):
         student_context = {
             "index_page_url": self.index_page_url,
-            "completion_status": self.get_completion_status(),
+            "completion_status": self.lesson_status,
             "grade": self.get_grade(),
+            "can_view_student_reports": self.can_view_student_reports,
             "scorm_xblock": self,
         }
         student_context.update(context or {})
         template = self.render_template("static/html/scormxblock.html", student_context)
         frag = Fragment(template)
         frag.add_css(self.resource_string("static/css/scormxblock.css"))
+        frag.add_javascript(self.resource_string("static/js/src/scorm.js"))
         frag.add_javascript(self.resource_string("static/js/src/scormxblock.js"))
+        frag.add_javascript(self.resource_string("static/js/vendor/renderjson.js"))
         frag.initialize_js(
-            "ScormXBlock", json_args={"scorm_version": self.scorm_version}
+            "ScormXBlock",
+            json_args={
+                "scorm_version": self.scorm_version,
+                "popup_on_launch": self.popup_on_launch,
+                "popup_width": self.width or 800,
+                "popup_height": self.height or 800,
+                "scorm_data": self.scorm_data,
+            },
         )
         return frag
+
+    @XBlock.handler
+    def assets_proxy(self, request, suffix):
+        """
+        Proxy view for serving assets. It receives a request with the path to the asset to serve, generates a pre-signed
+        URL to access the content in the AWS S3 bucket, and returns a redirect response to the pre-signed URL.
+
+        Parameters:
+        ----------
+        request : django.http.request.HttpRequest
+            HTTP request object containing the path to the asset to serve.
+        suffix : str
+            The part of the URL after 'assets_proxy/', i.e., the path to the asset to serve.
+
+        Returns:
+        -------
+        Response object containing the content of the requested file with the appropriate content type.
+        """
+        file_name = os.path.basename(suffix)
+        signed_url = self.storage.url(suffix)
+        file_type, _ = mimetypes.guess_type(file_name)
+        with urllib.request.urlopen(signed_url) as response:
+            file_content = response.read()
+
+        return Response(
+            file_content, content_type=file_type
+        )
 
     def studio_view(self, context=None):
         # Note that we cannot use xblockutils's StudioEditableXBlockMixin because we
@@ -142,6 +244,7 @@ class ScormXBlock(XBlock):
             "field_weight": self.fields["weight"],
             "field_width": self.fields["width"],
             "field_height": self.fields["height"],
+            "field_popup_on_launch": self.fields["popup_on_launch"],
             "scorm_xblock": self,
         }
         studio_context.update(context or {})
@@ -161,10 +264,11 @@ class ScormXBlock(XBlock):
     @XBlock.handler
     def studio_submit(self, request, _suffix):
         self.display_name = request.params["display_name"]
-        self.width = request.params["width"]
-        self.height = request.params["height"]
-        self.has_score = request.params["has_score"] == "True"
-        self.weight = request.params["weight"]
+        self.width = parse_int(request.params["width"], None)
+        self.height = parse_int(request.params["height"], None)
+        self.has_score = request.params["has_score"] == "1"
+        self.weight = parse_float(request.params["weight"], 1)
+        self.popup_on_launch = request.params["popup_on_launch"] == "1"
         self.icon_class = "problem" if self.has_score else "video"
 
         response = {"result": "success", "errors": []}
@@ -175,64 +279,101 @@ class ScormXBlock(XBlock):
         package_file = request.params["file"].file
         self.update_package_meta(package_file)
 
-        # First, save scorm file in the storage for mobile clients
-        if default_storage.exists(self.package_path):
-            logger.info('Removing previously uploaded "%s"', self.package_path)
-            default_storage.delete(self.package_path)
-        default_storage.save(self.package_path, File(package_file))
-        logger.info('Scorm "%s" file stored at "%s"', package_file, self.package_path)
+        # Clean storage folder, if it already exists
+        self.clean_storage()
 
-        # Then, extract zip file
-        if default_storage.exists(self.extract_folder_base_path):
-            logger.info(
-                'Removing previously unzipped "%s"', self.extract_folder_base_path
-            )
-            recursive_delete(self.extract_folder_base_path)
-        with zipfile.ZipFile(package_file, "r") as scorm_zipfile:
-            for zipinfo in scorm_zipfile.infolist():
-                # Do not unzip folders, only files. In Python 3.6 we will have access to
-                # the is_dir() method to verify whether a ZipInfo object points to a
-                # directory.
-                # https://docs.python.org/3.6/library/zipfile.html#zipfile.ZipInfo.is_dir
-                if not zipinfo.filename.endswith("/"):
-                    default_storage.save(
-                        os.path.join(self.extract_folder_path, zipinfo.filename),
-                        scorm_zipfile.open(zipinfo.filename),
-                    )
-
+        # Extract zip file
         try:
+            self.extract_package(package_file)
             self.update_package_fields()
         except ScormError as e:
             response["errors"].append(e.args[0])
 
         return self.json_response(response)
 
+    @XBlock.handler
+    def popup_window(self, request, _suffix):
+        """
+        Standalone popup window
+        """
+        rendered = self.render_template(
+            "static/html/popup.html",
+            {
+                "index_page_url": self.index_page_url,
+                "width": self.width or 800,
+                "height": self.height or 800,
+            },
+        )
+        return Response(body=rendered)
+
+    def clean_storage(self):
+        if self.storage.exists(self.extract_folder_base_path):
+            logger.info(
+                'Removing previously unzipped "%s"', self.extract_folder_base_path
+            )
+            self.recursive_delete(self.extract_folder_base_path)
+
+    def recursive_delete(self, root):
+        """
+        Recursively delete the contents of a directory in the Django default storage.
+        Unfortunately, this will not delete empty folders, as the default FileSystemStorage
+        implementation does not allow it.
+        """
+        directories, files = self.storage.listdir(root)
+        for directory in directories:
+            self.recursive_delete(os.path.join(root, directory))
+        for f in files:
+            self.storage.delete(os.path.join(root, f))
+
+    def extract_package(self, package_file):
+        with zipfile.ZipFile(package_file, "r") as scorm_zipfile:
+            zipinfos = scorm_zipfile.infolist()
+            root_path = None
+            root_depth = -1
+            # Find root folder which contains imsmanifest.xml
+            for zipinfo in zipinfos:
+                if os.path.basename(zipinfo.filename) == "imsmanifest.xml":
+                    depth = len(os.path.split(zipinfo.filename))
+                    if depth < root_depth or root_depth < 0:
+                        root_path = os.path.dirname(zipinfo.filename)
+                        root_depth = depth
+
+            if root_path is None:
+                raise ScormError(
+                    "Could not find 'imsmanifest.xml' file in the scorm package"
+                )
+
+            for zipinfo in zipinfos:
+                # Extract only files that are below the root
+                if zipinfo.filename.startswith(root_path):
+                    # Do not unzip folders, only files. In Python 3.6 we will have access to
+                    # the is_dir() method to verify whether a ZipInfo object points to a
+                    # directory.
+                    # https://docs.python.org/3.6/library/zipfile.html#zipfile.ZipInfo.is_dir
+                    if not zipinfo.filename.endswith("/"):
+                        dest_path = os.path.join(
+                            self.extract_folder_path,
+                            os.path.relpath(zipinfo.filename, root_path),
+                        )
+                        self.storage.save(
+                            dest_path,
+                            ContentFile(scorm_zipfile.read(zipinfo.filename)),
+                        )
+
     @property
     def index_page_url(self):
         if not self.package_meta or not self.index_page_path:
             return ""
         folder = self.extract_folder_path
-        if default_storage.exists(
+        if self.storage.exists(
             os.path.join(self.extract_folder_base_path, self.index_page_path)
         ):
             # For backward-compatibility, we must handle the case when the xblock data
             # is stored in the base folder.
             folder = self.extract_folder_base_path
             logger.warning("Serving SCORM content from old-style path: %s", folder)
-        return default_storage.url(os.path.join(folder, self.index_page_path))
 
-    @property
-    def package_path(self):
-        """
-        Get file path of storage.
-        """
-        return (
-            "{loc.org}/{loc.course}/{loc.block_type}/{loc.block_id}/{sha1}{ext}"
-        ).format(
-            loc=self.location,
-            sha1=self.package_meta["sha1"],
-            ext=os.path.splitext(self.package_meta["name"])[1],
-        )
+        return self.storage.url(os.path.join(folder, self.index_page_path))
 
     @property
     def extract_folder_path(self):
@@ -251,6 +392,9 @@ class ScormXBlock(XBlock):
 
     @XBlock.json_handler
     def scorm_get_value(self, data, _suffix):
+        """
+        Here we get only the get_value events that were not filtered by the LMSGetValue js function.
+        """
         name = data.get("name")
         if name in ["cmi.core.lesson_status", "cmi.completion_status"]:
             return {"value": self.lesson_status}
@@ -258,58 +402,89 @@ class ScormXBlock(XBlock):
             return {"value": self.success_status}
         if name in ["cmi.core.score.raw", "cmi.score.raw"]:
             return {"value": self.lesson_score * 100}
+        if name in ["cmi.core.student_id", "cmi.learner_id"]:
+            return {"value": self.get_current_user_attr("edx-platform.user_id")}
+        if name in ["cmi.core.student_name", "cmi.learner_name"]:
+            return {"value": self.get_current_user_attr("edx-platform.username")}
         return {"value": self.scorm_data.get(name, "")}
 
     @XBlock.json_handler
+    def scorm_set_values(self, data_list, _suffix):
+        return [self.set_value(data) for data in data_list]
+
+    @XBlock.json_handler
     def scorm_set_value(self, data, _suffix):
-        context = {"result": "success"}
+        try:
+            return self.set_value(data)
+        except ValueError as e:
+            return JsonHandlerError(400, e.args[0]).get_response()
+
+    def set_value(self, data):
         name = data.get("name")
+        value = data.get("value")
+        completion_percent = None
+        success_status = None
+        completion_status = None
+        lesson_score = None
 
-        if name in ["cmi.core.lesson_status", "cmi.completion_status"]:
-            self.lesson_status = data.get("value")
-            if self.has_score and data.get("value") in [
-                "completed",
-                "failed",
-                "passed",
-            ]:
-                self.publish_grade()
-                context.update({"lesson_score": self.lesson_score})
+        self.scorm_data[name] = value
+        if name == "cmi.core.lesson_status":
+            lesson_status = data.get("value")
+            if lesson_status in ["passed", "failed"]:
+                success_status = lesson_status
+            elif lesson_status in ["completed", "incomplete"]:
+                completion_status = lesson_status
         elif name == "cmi.success_status":
-            self.success_status = data.get("value")
-            if self.has_score:
-                if self.success_status == "unknown":
-                    self.lesson_score = 0
-                self.publish_grade()
-                context.update({"lesson_score": self.lesson_score})
+            success_status = value
+        elif name == "cmi.completion_status":
+            completion_status = value
         elif name in ["cmi.core.score.raw", "cmi.score.raw"] and self.has_score:
-            self.lesson_score = float(data.get("value", 0)) / 100.0
-            self.publish_grade()
-            context.update({"lesson_score": self.lesson_score})
-        else:
-            self.scorm_data[name] = data.get("value", "")
+            lesson_score = parse_validate_positive_float(value, name) / 100.0
+        elif name == "cmi.progress_measure":
+            completion_percent = parse_validate_positive_float(value, name)
 
-        context.update({"completion_status": self.get_completion_status()})
+        context = {"result": "success"}
+        if lesson_score is not None:
+            self.lesson_score = lesson_score
+            context.update({"grade": self.get_grade()})
+        if completion_percent is not None:
+            self.emit_completion(completion_percent)
+        if completion_status:
+            self.lesson_status = completion_status
+            context.update({"completion_status": completion_status})
+        if success_status:
+            self.success_status = success_status
+        if completion_status == "completed":
+            self.emit_completion(1)
+        if success_status or completion_status == "completed":
+            if self.has_score:
+                self.publish_grade()
+
         return context
 
     def publish_grade(self):
         self.runtime.publish(
-            self, "grade", {"value": self.get_grade(), "max_value": self.weight},
+            self,
+            "grade",
+            {"value": self.get_grade(), "max_value": self.weight},
         )
 
     def get_grade(self):
-        lesson_score = self.lesson_score
-        if self.lesson_status == "failed" or (
-            self.scorm_version == "SCORM_2004"
-            and self.success_status in ["failed", "unknown"]
-        ):
-            lesson_score = 0
+        lesson_score = 0 if self.is_failed else self.lesson_score
         return lesson_score * self.weight
+
+    @property
+    def is_failed(self):
+        return self.success_status == "failed"
 
     def set_score(self, score):
         """
         Utility method used to rescore a problem.
         """
-        self.lesson_score = score.raw_earned / self.weight
+        if self.has_score:
+            self.lesson_score = score.raw_earned
+            self.publish_grade()
+            self.emit_completion(1)
 
     def max_score(self):
         """
@@ -330,50 +505,64 @@ class ScormXBlock(XBlock):
         """
         Update version and index page path fields.
         """
-        self.index_page_path = ""
-        imsmanifest_path = os.path.join(self.extract_folder_path, "imsmanifest.xml")
-        try:
-            imsmanifest_file = default_storage.open(imsmanifest_path)
-        except IOError:
-            raise ScormError(
-                "Invalid package: could not find 'imsmanifest.xml' file at the root of the zip file"
-            )
+        imsmanifest_path = self.find_file_path("imsmanifest.xml")
+        imsmanifest_file = self.storage.open(imsmanifest_path)
+        tree = ET.parse(imsmanifest_file)
+        imsmanifest_file.seek(0)
+        namespace = ""
+        for _, node in ET.iterparse(imsmanifest_file, events=["start-ns"]):
+            if node[0] == "":
+                namespace = node[1]
+                break
+        root = tree.getroot()
+
+        prefix = "{" + namespace + "}" if namespace else ""
+        resource = root.find(
+            "{prefix}resources/{prefix}resource[@href]".format(prefix=prefix)
+        )
+        schemaversion = root.find(
+            "{prefix}metadata/{prefix}schemaversion".format(prefix=prefix)
+        )
+
+        if resource is not None:
+            self.index_page_path = resource.get("href")
         else:
-            tree = ET.parse(imsmanifest_file)
-            imsmanifest_file.seek(0)
-            self.index_page_path = "index.html"
-            namespace = ""
-            for _, node in ET.iterparse(imsmanifest_file, events=["start-ns"]):
-                if node[0] == "":
-                    namespace = node[1]
-                    break
-            root = tree.getroot()
+            self.index_page_path = self.find_relative_file_path("index.html")
+        if (schemaversion is not None) and (
+            re.match("^1.2$", schemaversion.text) is None
+        ):
+            self.scorm_version = "SCORM_2004"
+        else:
+            self.scorm_version = "SCORM_12"
 
-            if namespace:
-                resource = root.find(
-                    "{{{0}}}resources/{{{0}}}resource".format(namespace)
-                )
-                schemaversion = root.find(
-                    "{{{0}}}metadata/{{{0}}}schemaversion".format(namespace)
-                )
-            else:
-                resource = root.find("resources/resource")
-                schemaversion = root.find("metadata/schemaversion")
+    def find_relative_file_path(self, filename):
+        return os.path.relpath(self.find_file_path(filename), self.extract_folder_path)
 
-            if resource:
-                self.index_page_path = resource.get("href")
-            if (schemaversion is not None) and (
-                re.match("^1.2$", schemaversion.text) is None
-            ):
-                self.scorm_version = "SCORM_2004"
-            else:
-                self.scorm_version = "SCORM_12"
+    def find_file_path(self, filename):
+        """
+        Search recursively in the extracted folder for a given file. Path of the first
+        found file will be returned. Raise a ScormError if file cannot be found.
+        """
+        path = self.get_file_path(filename, self.extract_folder_path)
+        if path is None:
+            raise ScormError(
+                "Invalid package: could not find '{}' file".format(filename)
+            )
+        return path
 
-    def get_completion_status(self):
-        completion_status = self.lesson_status
-        if self.scorm_version == "SCORM_2004" and self.success_status != "unknown":
-            completion_status = self.success_status
-        return completion_status
+    def get_file_path(self, filename, root):
+        """
+        Same as `find_file_path`, but don't raise error on file not found.
+        """
+        subfolders, files = self.storage.listdir(root)
+        for f in files:
+            if f == filename:
+                return os.path.join(root, filename)
+        for subfolder in subfolders:
+            path = self.get_file_path(filename, os.path.join(root, subfolder))
+            if path is not None:
+                return path
+        return None
 
     def scorm_location(self):
         """
@@ -381,11 +570,7 @@ class ScormXBlock(XBlock):
         accessible at a url with that also includes this name.
         """
         default_scorm_location = "scorm"
-        settings_service = self.runtime.service(self, "settings")
-        if not settings_service:
-            return default_scorm_location
-        xblock_settings = settings_service.get_settings_bucket(self)
-        return xblock_settings.get("LOCATION", default_scorm_location)
+        return self.xblock_settings.get("LOCATION", default_scorm_location)
 
     @staticmethod
     def get_sha1(file_descriptor):
@@ -406,15 +591,91 @@ class ScormXBlock(XBlock):
         """
         Inform REST api clients about original file location and it's "freshness".
         Make sure to include `student_view_data=openedxscorm` to URL params in the request.
+
+        Note: we are not sure what this view is for and it might be removed in the future.
         """
         if self.index_page_url:
             return {
                 "last_modified": self.package_meta.get("last_updated", ""),
-                "scorm_data": default_storage.url(self.package_path),
                 "size": self.package_meta.get("size", 0),
                 "index_page": self.index_page_path,
             }
         return {}
+
+    @XBlock.handler
+    def scorm_search_students(self, data, _suffix):
+        """
+        Search enrolled students by username/email.
+        """
+        if not self.can_view_student_reports:
+            return Response(status=403)
+        query = data.params.get("id", "")
+        enrollments = (
+            CourseEnrollment.objects.filter(
+                is_active=True,
+                course=self.runtime.course_id,
+            )
+            .select_related("user")
+            .order_by("user__username")
+        )
+        if query:
+            enrollments = enrollments.filter(
+                Q(user__username__startswith=query) | Q(user__email__startswith=query)
+            )
+        # The format of each result is dictated by the autocomplete js library:
+        # https://github.com/dyve/jquery-autocomplete/blob/master/doc/jquery.autocomplete.txt
+        return self.json_response(
+            [
+                {
+                    "data": {"student_id": enrollment.user.id},
+                    "value": "{} ({})".format(
+                        enrollment.user.username, enrollment.user.email
+                    ),
+                }
+                for enrollment in enrollments[:20]
+            ]
+        )
+
+    @XBlock.handler
+    def scorm_get_student_state(self, data, _suffix):
+        if not self.can_view_student_reports:
+            return Response(status=403)
+        user_id = data.params.get("id")
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return Response(
+                body="Invalid 'id' parameter {}".format(user_id), status=400
+            )
+        try:
+            module = StudentModule.objects.filter(
+                course_id=self.runtime.course_id,
+                module_state_key=self.scope_ids.usage_id,
+                student__id=user_id,
+            ).get()
+        except StudentModule.DoesNotExist:
+            return Response(
+                body="No data found for student id={}".format(user_id),
+                status=404,
+            )
+        except StudentModule.MultipleObjectsReturned:
+            logger.error(
+                "Multiple StudentModule objects found for Scorm xblock: "
+                "course_id=%s module_state_key=%s student__id=%s",
+                self.runtime.course_id,
+                self.scope_ids.usage_id,
+                user_id,
+            )
+            raise
+        module_state = json.loads(module.state)
+        scorm_data = module_state.get("scorm_data", {})
+        return self.json_response(scorm_data)
+
+    @property
+    def can_view_student_reports(self):
+        if StudentModule is None:
+            return False
+        return getattr(self.runtime, "user_is_staff", False)
 
     @staticmethod
     def workbench_scenarios():
@@ -429,18 +690,58 @@ class ScormXBlock(XBlock):
             ),
         ]
 
+    @property
+    def storage(self):
+        """
+        Return the storage backend used to store the assets of this xblock. This is a cached property.
+        """
+        if not getattr(self, "_storage", None):
 
-def recursive_delete(root):
-    """
-    Recursively delete the contents of a directory in the Django default storage.
-    Unfortunately, this will not delete empty folders, as the default FileSystemStorage
-    implementation does not allow it.
-    """
-    directories, files = default_storage.listdir(root)
-    for directory in directories:
-        recursive_delete(os.path.join(root, directory))
-    for f in files:
-        default_storage.delete(os.path.join(root, f))
+            def get_default_storage(_xblock):
+                return default_storage
+
+            storage_func = self.xblock_settings.get("STORAGE_FUNC", get_default_storage)
+            if isinstance(storage_func, string_types):
+                storage_func = import_string(storage_func)
+            self._storage = storage_func(self)
+
+        return self._storage
+
+    @property
+    def xblock_settings(self):
+        """
+        Return a dict of settings associated to this XBlock.
+        """
+        settings_service = self.runtime.service(self, "settings") or {}
+        if not settings_service:
+            return {}
+        return settings_service.get_settings_bucket(self)
+
+
+def parse_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_validate_positive_float(value, name):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Could not parse value of '{}' (must be float): {}".format(name, value)
+        )
+    if parsed < 0:
+        raise ValueError("Value of '{}' must not be negative: {}".format(name, value))
+    return parsed
 
 
 class ScormError(Exception):
