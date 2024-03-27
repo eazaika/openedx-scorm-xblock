@@ -4,10 +4,10 @@ Storage backend for scorm metadata export.
 import os
 from django.conf import settings
 
-from storages.backends.s3boto3 import S3Boto3Storage
+from storages.backends.s3boto import S3BotoStorage
 
 
-class S3ScormStorage(S3Boto3Storage):
+class S3ScormStorage(S3BotoStorage):
     """
     S3 backend for scorm metadata export
     """
@@ -16,7 +16,7 @@ class S3ScormStorage(S3Boto3Storage):
         self.xblock = xblock
         # No need to serve assets from a custom domain.
         self.custom_domain = None
-        super().__init__(
+        super(S3ScormStorage, self).__init__(
             bucket_name=bucket_name,
             querystring_auth=querystring_auth,
             querystring_expire=querystring_expire,
@@ -24,11 +24,11 @@ class S3ScormStorage(S3Boto3Storage):
 
     def url(self, name, parameters=None, expire=None):
         """
-        Override url method of S3Boto3Storage
+        Override url method of S3BotoStorage
         """
         if not self.querystring_auth:
             # No need to use assets proxy when authentication is disabled
-            return super().url(name, parameters=parameters, expire=expire)
+            return super(S3ScormStorage).url(name, parameters=parameters, expire=expire)
 
         if name.startswith(self.xblock.extract_folder_path):
             # Proxy assets serving through the `assets_proxy` view. This case should
@@ -41,10 +41,10 @@ class S3ScormStorage(S3Boto3Storage):
             return f"{proxy_base_url}/{self.xblock.index_page_path}"
 
         # This branch is executed when the `url` method is called from `assets_proxy`
-        return super().url(
+        return super(S3ScormStorage, self).url(
             os.path.join(self.xblock.extract_folder_path, name),
-            parameters=parameters,
-            expire=expire,
+            parameters,
+            expire,
         )
 
 

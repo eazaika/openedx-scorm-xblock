@@ -7,6 +7,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 import mimetypes
 import urllib
+from urllib2 import urlopen
+from contextlib import closing
 
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
@@ -27,11 +29,12 @@ from xblock.fields import Scope, String, Float, Boolean, Dict, DateTime, Integer
 try:
     try:
         from common.djangoapps.student.models import CourseEnrollment
-    except RuntimeError:
+        from lms.djangoapps.courseware.models import StudentModule
+    except ImportError:
         # Older Open edX releases have a different import path
         from student.models import CourseEnrollment
-    from lms.djangoapps.courseware.models import StudentModule
-except ImportError:
+        from courseware.models import StudentModule
+except:
     CourseEnrollment = None
     StudentModule = None
 
@@ -174,7 +177,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         template = Template(template_str)
         return template.render(Context(context))
 
-    def get_current_user_attr(self, attr: str):
+    def get_current_user_attr(self, attr):
         return self.get_current_user().opt_attrs.get(attr)
 
     def get_current_user(self):
@@ -197,7 +200,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
 
     def student_view(self, context=None):
         student_context = {
-            "index_page_url": urllib.parse.unquote(self.index_page_url),
+            "index_page_url": urllib.url2pathname(self.index_page_url),
             "completion_status": self.lesson_status,
             "grade": self.get_grade(),
             "can_view_student_reports": self.can_view_student_reports,
@@ -245,7 +248,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         if request.query_string:
             signed_url = '&'.join([signed_url, request.query_string])
         file_type, _ = mimetypes.guess_type(file_name)
-        with urllib.request.urlopen(signed_url) as response:
+        with closing(urlopen(signed_url)) as response:
             file_content = response.read()
 
         return Response(file_content, content_type=file_type)
@@ -604,7 +607,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         else:
             resource = root.find("{prefix}resources/{prefix}resource[@identifier='{identifier}']".format(prefix=prefix, identifier=item_identifier))
             # Attach the storage path with the file path
-            resource_link = urllib.parse.unquote(
+            resource_link = urllib.url2pathname(
                 self.storage.url(os.path.join(self.extract_folder_path, resource.get("href")))
             )
         if not children:

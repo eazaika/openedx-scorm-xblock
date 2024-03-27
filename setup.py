@@ -41,7 +41,7 @@ setup(
         "Community": "https://discuss.openedx.com",
     },
     packages=["openedxscorm"],
-    python_requires=">=3.8",
+    python_requires="<3.8",
     install_requires=["xblock", "web-fragments"],
     entry_points={"xblock.v1": ["scorm = openedxscorm:ScormXBlock"]},
     package_data=package_data("openedxscorm", ["static", "public", "locale"]),
