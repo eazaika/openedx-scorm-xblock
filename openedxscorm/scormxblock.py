@@ -14,8 +14,9 @@ from django.db.models import Q
 from django.template import Context, Template
 from django.utils import timezone
 from django.utils.module_loading import import_string
-from urllib.parse import urlparse
-import urllib.request
+from urlparse import urlparse
+from urllib2 import urlopen
+from contextlib import closing
 from webob import Response
 import pkg_resources
 from six import string_types
@@ -160,7 +161,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         template = Template(template_str)
         return template.render(Context(context))
 
-    def get_current_user_attr(self, attr: str):
+    def get_current_user_attr(self, attr):
         return self.get_current_user().opt_attrs.get(attr)
 
     def get_current_user(self):
@@ -228,7 +229,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         file_name = os.path.basename(suffix)
         signed_url = self.storage.url(suffix)
         file_type, _ = mimetypes.guess_type(file_name)
-        with urllib.request.urlopen(signed_url) as response:
+        with closing(urlopen(signed_url)) as response:
             file_content = response.read()
 
         return Response(

@@ -5,38 +5,37 @@ import os
 from django.conf import settings
 
 from django.core.files.storage import get_storage_class
-from storages.backends.s3boto3 import S3Boto3Storage
+from storages.backends.s3boto import S3BotoStorage
 
 
-class S3ScormStorage(S3Boto3Storage):
+class S3ScormStorage(S3BotoStorage):
     """
     S3 backend for scorm metadata export
     """
     def __init__(self, xblock, bucket, querystring_auth, querystring_expire):
         self.xblock = xblock
         self.custom_domain = None
-        super().__init__(bucket=bucket, querystring_auth=querystring_auth,
+
+        super(S3ScormStorage, self).__init__(bucket=bucket, querystring_auth=querystring_auth,
                          querystring_expire=querystring_expire)
 
     def url(self, name, parameters=None, expire=None):
         """
-        Override url method of S3Boto3Storage
+        Override url method of S3BotoStorage
         """
         # No need to use assets proxy when authentication is disabled
         if not self.querystring_auth:
-            return super().url(name, parameters, expire)
+            return super(S3ScormStorage, self).url(name, parameters, expire)
 
         if name.startswith(self.xblock.extract_folder_path):
-            handler_url = self.xblock.runtime.handler_url(self.xblock, 'assets_proxy')
-
             # remove trailing '?' if it's present
             handler_url = self.xblock.runtime.handler_url(self.xblock, 'assets_proxy').rstrip("?/")
 
             # construct the URL for proxy function
-            return f"{handler_url}/{self.xblock.index_page_path}"
+            return "{}/{}".format(handler_url, self.xblock.index_page_path)
 
         # This branch is executed when the `url` method is called from `assets_proxy`
-        return super().url(os.path.join(self.xblock.extract_folder_path, name), parameters, expire)
+        return super(S3ScormStorage, self).url(os.path.join(self.xblock.extract_folder_path, name), parameters, expire)
 
 def s3(xblock):
     """
